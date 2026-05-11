@@ -1,0 +1,159 @@
+#include <Wire.h>
+#include <LiquidCrystal_I2C.h>
+#include <WiFi.h>
+#include <esp_now.h>
+
+// ===== LCD =====
+LiquidCrystal_I2C lcd(0x27, 16, 2);
+
+// ===== BUTTONS =====
+const int buttonPins[8] = {0xA4, 0xF0, 0x0F, 0x8E, 0x6B, 0x68};
+bool lastButtonState[8] = {0};
+
+// ===== COMMANDS =====
+const char* moveCommands[4] = {
+  "FORWARD","RIGHT","LEFT","BACK"
+};
+
+const char* menuItems[] = {
+  "Triangle","Square","V","T","Line","Horizontal"
+};
+
+int menuSize = sizeof(menuItems)/sizeof(menuItems[0]);
+int currentIndex = 0;
+
+// ===== MESSAGE =====
+typedef struct {
+  char command[20];
+} Message;
+
+Message msg;
+Message incomingMsg;
+
+// ===== MASTER MAC =====
+uint8_t masterAddress[] = {0x5C,0x01,0x3B,0x98,0xAD,0xB8};
+
+// ===== LCD =====
+void showMenu() {
+  lcd.clear();
+  lcd.setCursor(0,0);
+  lcd.print("Form:");
+  lcd.print(menuItems[currentIndex]);
+  lcd.setCursor(0,1);
+  lcd.print("Press Send");
+}
+
+// ===== SEND =====
+void sendCommand(const char* cmd){
+  strcpy(msg.command, cmd);
+  esp_now_send(masterAddress, (uint8_t*)&msg, sizeof(msg));
+
+  Serial.print("Sent: ");
+  Serial.println(cmd);
+}
+
+// ===== RECEIVE =====
+void onReceive(const esp_now_recv_info *info, const uint8_t *data, int len){
+  memcpy(&incomingMsg, data, sizeof(incomingMsg));
+
+  lcd.clear();
+
+  if(strcmp(incomingMsg.command, "OBSTACLE") == 0){
+    lcd.setCursor(0,0);
+    lcd.print("MASTER ALERT");
+    lcd.setCursor(0,1);
+    lcd.print("Obstacle!");
+  }
+  else if(strcmp(incomingMsg.command, "SLAVE_OBSTACLE") == 0){
+    lcd.setCursor(0,0);
+    lcd.print("SLAVE ALERT");
+    lcd.setCursor(0,1);
+    lcd.print("Obstacle!");
+  }
+}
+
+// ===== CALLBACK =====
+void onSent(const uint8_t *mac, esp_now_send_status_t status) {
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "OK" : "FAIL");
+}
+
+
+void setup() {
+  Serial.begin(115200);
+
+  Wire.begin(21,22);
+  lcd.init();
+  lcd.backlight();
+
+  WiFi.mode(WIFI_STA);
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW FAIL");
+    return;
+  }
+
+  esp_now_register_send_cb(onSent);
+  esp_now_register_recv_cb(onReceive);
+
+  //MASTER
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, masterAddress, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+
+  for(int i=0;i<8;i++){
+    pinMode(buttonPins[i], INPUT_PULLDOWN);
+  }
+
+  showMenu();
+}
+
+
+void loop() {
+
+  for(int i=0;i<8;i++){
+    bool state = digitalRead(buttonPins[i]);
+
+    if(state == HIGH && lastButtonState[i] == LOW){
+
+      // ===== MOVEMENT (1–4) =====
+      if(i <= 3){
+        lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print(moveCommands[i]);
+        sendCommand(moveCommands[i]);
+      }
+
+      // ===== SEND FORMATION =====
+      else if(i == 4){
+        sendCommand(menuItems[currentIndex]);
+
+        lcd.clear();
+        lcd.setCursor(0,0);
+        lcd.print("Formation Sent");
+        lcd.setCursor(0,1);
+        lcd.print(menuItems[currentIndex]);
+      }
+
+      // ===== BUTTON 6 UNUSED =====
+      else if(i == 5){}
+
+      // ===== NEXT =====
+      else if(i == 6){
+        currentIndex = (currentIndex + 1) % menuSize;
+        showMenu();
+      }
+
+      // ===== PREVIOUS =====
+      else if(i == 7){
+        currentIndex = (currentIndex - 1 + menuSize) % menuSize;
+        showMenu();
+      }
+    }
+
+    lastButtonState[i] = state;
+  }
+
+  delay(120);
+}
