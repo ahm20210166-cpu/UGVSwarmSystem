@@ -1,0 +1,149 @@
+import cv2, math, time, json, os, warnings
+from gpiozero import Servo
+warnings.filterwarnings("ignore")
+
+# ---- Vision/QR ----
+SAVE_FILE = "/home/malekehab/ugv/qr_focal_px.json"
+QR_CM = 5.0
+W, H = 640, 480
+CENTER_BOX_W, CENTER_BOX_H = 140, 140
+STABLE_FRAMES = 8
+HOLD_SECONDS = 0.6
+
+# ---- Servo ----
+SERVO_GPIO = 18
+STEP = 0.03
+DELAY = 0.03
+
+def side_px(pts4):
+    pts4 = pts4.reshape(-1,2)
+    def dist(a,b): return math.hypot(a[0]-b[0], a[1]-b[1])
+    return (dist(pts4[0],pts4[1]) + dist(pts4[1],pts4[2]) +
+            dist(pts4[2],pts4[3]) + dist(pts4[3],pts4[0])) / 4.0
+
+# Load calibration
+if not os.path.exists(SAVE_FILE):
+    print("ERROR: calibration file not found:", SAVE_FILE)
+    raise SystemExit(1)
+focal_px = float(json.load(open(SAVE_FILE)).get("focal_px"))
+print(f"Loaded calibration focal_px={focal_px:.2f}", flush=True)
+
+# Servo init
+servo = Servo(SERVO_GPIO, min_pulse_width=0.0006, max_pulse_width=0.0024)
+pos, direction = 0.0, 1
+servo.value = pos
+
+# Camera init
+cap = cv2.VideoCapture(0, cv2.CAP_V4L2)
+cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
+cap.set(cv2.CAP_PROP_FRAME_WIDTH, W)
+cap.set(cv2.CAP_PROP_FRAME_HEIGHT, H)
+cap.set(cv2.CAP_PROP_FPS, 30)
+
+det = cv2.QRCodeDetector()
+
+cx, cy = W//2, H//2
+x1, y1 = cx - CENTER_BOX_W//2, cy - CENTER_BOX_H//2
+x2, y2 = cx + CENTER_BOX_W//2, cy + CENTER_BOX_H//2
+
+found = {}   # text -> dist
+order = []   # [first, second]
+current_txt, count, last_dist = None, 0, None
+
+def freeze_servo(seconds):
+    servo.detach()
+    time.sleep(seconds)
+    servo.value = pos
+
+print("Searching for TWO centered QRs (no ESP send). Press 'q' to quit.", flush=True)
+
+try:
+    while True:
+        # Sweep servo until two saved
+        if len(order) < 2:
+            pos += direction * STEP
+            if pos >= 1.0:
+                pos = 1.0; direction = -1
+            elif pos <= -1.0:
+                pos = -1.0; direction = 1
+            servo.value = pos
+            time.sleep(DELAY)
+
+        ok, frame = cap.read()
+        if not ok:
+            continue
+
+        cv2.rectangle(frame, (x1,y1), (x2,y2), (0,255,0), 2)
+        cv2.putText(frame, "Center QR here", (x1, y1-10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+
+        data, pts, _ = det.detectAndDecode(frame)
+        txt = (data or "").strip()
+
+        centered_visible = False
+        dist_cm = None
+
+        if pts is not None and len(pts) > 0 and txt:
+            p = pts.astype(int).reshape(-1,2)
+            qx = int(p[:,0].mean())
+            qy = int(p[:,1].mean())
+            centered_visible = (x1 <= qx <= x2) and (y1 <= qy <= y2)
+
+            for i in range(4):
+                cv2.line(frame, tuple(p[i]), tuple(p[(i+1)%4]), (0,255,0), 2)
+            cv2.circle(frame, (qx,qy), 4, (0,255,0), -1)
+
+            if centered_visible:
+                dist_cm = (focal_px * QR_CM) / max(side_px(pts), 1e-6)
+
+        if centered_visible:
+            cv2.putText(frame, "CENTERED", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+            cv2.putText(frame, f"Distance: {dist_cm:.1f} cm", (10,65),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0,255,0), 2)
+            cv2.putText(frame, f"QR: {txt[:40]}", (10,100),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0,255,0), 2)
+        else:
+            cv2.putText(frame, "NOT CENTERED", (10,30), cv2.FONT_HERSHEY_SIMPLEX, 0.9, (0,255,0), 2)
+
+        # Stability only when centered
+        if centered_visible:
+            if txt == current_txt:
+                count += 1
+            else:
+                current_txt = txt
+                count = 1
+            last_dist = dist_cm
+        else:
+            current_txt, count, last_dist = None, 0, None
+
+        # Save QR
+        if centered_visible and count >= STABLE_FRAMES and txt not in found and len(order) < 2:
+            found[txt] = float(last_dist)
+            order.append(txt)
+            which = "FIRST" if len(order)==1 else "SECOND"
+            print(f"SAVED {which}: {txt} dist_cm={found[txt]:.1f}", flush=True)
+            freeze_servo(HOLD_SECONDS)
+
+            if len(order) == 2:
+                servo.detach()
+                print("\nDONE  Both centered QRs saved:", flush=True)
+                print(f"1) {order[0]}  dist_cm={found[order[0]]:.1f}", flush=True)
+                print(f"2) {order[1]}  dist_cm={found[order[1]]:.1f}", flush=True)
+                print("Servo stopped. Press 'q' to quit.", flush=True)
+
+        s1 = f"FIRST: {order[0]}" if len(order)>=1 else "FIRST: searching..."
+        s2 = f"SECOND: {order[1]}" if len(order)>=2 else "SECOND: searching..."
+        cv2.putText(frame, s1, (10, H-50), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,0), 2)
+        cv2.putText(frame, s2, (10, H-20), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0,255,0), 2)
+
+        cv2.imshow("Servo Centered QR + Distance (NO ESP)", frame)
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+
+finally:
+    try: servo.detach()
+    except: pass
+    try: cap.release()
+    except: pass
+    try: cv2.destroyAllWindows()
+    except: pass
