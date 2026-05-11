@@ -1,0 +1,283 @@
+#include <WiFi.h>
+#include <esp_now.h>
+
+#define MOTORS 2
+#define PULSES_PER_REV 980
+
+// ===== ENCODERS =====
+int ENCODER_A[MOTORS] = {32, 33};
+int ENCODER_B[MOTORS] = {27, 14};
+
+// ===== MOTORS =====
+int MOTOR_DIR_PIN1[MOTORS] = {18, 19};
+int MOTOR_DIR_PIN2[MOTORS] = {23, 5};
+int MOTOR_PWM_PIN[MOTORS]  = {25, 26};
+
+// ===== SETTINGS =====
+int motorSpeed = 200;
+
+#define LEFT_MOTOR  0
+#define RIGHT_MOTOR 1
+
+volatile long encoderCount[MOTORS] = {0, 0};
+
+// ===== ESP-NOW =====
+// Master MAC — robot that forwards commands to this slave
+uint8_t masterAddress[] = {0x5C, 0x01, 0x3B, 0x98, 0xAD, 0xB8}; // update to master robot MAC
+
+typedef struct {
+  char command[20];
+} Message;
+
+Message msg;
+Message incomingMsg;
+
+// ======================================
+// SEND TO MASTER
+// ======================================
+
+void sendToMaster(const char* status) {
+  strcpy(msg.command, status);
+  esp_now_send(masterAddress, (uint8_t*)&msg, sizeof(msg));
+  Serial.print("Sent to master: ");
+  Serial.println(status);
+}
+
+// ======================================
+// RECEIVE FROM MASTER
+// ======================================
+
+void onReceive(const esp_now_recv_info *info, const uint8_t *data, int len) {
+  memcpy(&incomingMsg, data, sizeof(incomingMsg));
+
+  Serial.print("Received: ");
+  Serial.println(incomingMsg.command);
+
+  // Execute movement
+  if      (strcmp(incomingMsg.command, "FORWARD")     == 0) moveForward();
+  else if (strcmp(incomingMsg.command, "BACK")        == 0) moveBack();
+  else if (strcmp(incomingMsg.command, "LEFT")        == 0) moveLeft();
+  else if (strcmp(incomingMsg.command, "RIGHT")       == 0) moveRight();
+  else if (strcmp(incomingMsg.command, "Triangle")    == 0) doTriangle();
+  else if (strcmp(incomingMsg.command, "Square")      == 0) doSquare();
+  else if (strcmp(incomingMsg.command, "V")           == 0) doV();
+  else if (strcmp(incomingMsg.command, "T")           == 0) doT();
+  else if (strcmp(incomingMsg.command, "Line")        == 0) doLine();
+  else if (strcmp(incomingMsg.command, "Horizontal")  == 0) doHorizontal();
+
+  // Report done to master
+  sendToMaster("SLAVE_DONE");
+}
+
+// ===== SEND CALLBACK =====
+void onSent(const uint8_t *mac, esp_now_send_status_t status) {
+  Serial.println(status == ESP_NOW_SEND_SUCCESS ? "Send OK" : "Send FAIL");
+}
+
+// ===== ADD PEER HELPER =====
+void addPeer(uint8_t* address) {
+  esp_now_peer_info_t peerInfo = {};
+  memcpy(peerInfo.peer_addr, address, 6);
+  peerInfo.channel = 0;
+  peerInfo.encrypt = false;
+  esp_now_add_peer(&peerInfo);
+}
+
+// ======================================
+// SETUP
+// ======================================
+
+void setup() {
+  Serial.begin(115200);
+  delay(500);
+
+  // --- Motor setup ---
+  for (int i = 0; i < MOTORS; i++) {
+    pinMode(MOTOR_DIR_PIN1[i], OUTPUT);
+    pinMode(MOTOR_DIR_PIN2[i], OUTPUT);
+    pinMode(MOTOR_PWM_PIN[i], OUTPUT);
+    stopMotor(i);
+  }
+
+  // --- Encoder setup ---
+  pinMode(ENCODER_A[LEFT_MOTOR],  INPUT_PULLUP);
+  pinMode(ENCODER_A[RIGHT_MOTOR], INPUT_PULLUP);
+
+  attachInterrupt(
+    digitalPinToInterrupt(ENCODER_A[LEFT_MOTOR]),
+    []() { encoderCount[LEFT_MOTOR]++; },
+    RISING
+  );
+  attachInterrupt(
+    digitalPinToInterrupt(ENCODER_A[RIGHT_MOTOR]),
+    []() { encoderCount[RIGHT_MOTOR]++; },
+    RISING
+  );
+
+  // --- ESP-NOW setup ---
+  WiFi.mode(WIFI_STA);
+
+  Serial.print("Slave MAC: ");
+  Serial.println(WiFi.macAddress()); // print this so you know the MAC
+
+  if (esp_now_init() != ESP_OK) {
+    Serial.println("ESP-NOW init FAILED");
+    return;
+  }
+
+  esp_now_register_send_cb(onSent);
+  esp_now_register_recv_cb(onReceive);
+
+  addPeer(masterAddress);
+
+  Serial.println("Slave ready");
+}
+
+// ======================================
+// LOOP
+// ======================================
+
+void loop() {
+  // Obstacle detection example — add your sensor logic here
+  // if (obstacleDetected()) {
+  //   sendToMaster("SLAVE_OBSTACLE");
+  //   stopAll();
+  // }
+}
+
+// ======================================
+// MOTOR FUNCTIONS
+// ======================================
+
+void moveMotorTurns(int motor, float turns) {
+  noInterrupts();
+  encoderCount[motor] = 0;
+  interrupts();
+
+  digitalWrite(MOTOR_DIR_PIN1[motor], HIGH);
+  digitalWrite(MOTOR_DIR_PIN2[motor], LOW);
+  analogWrite(MOTOR_PWM_PIN[motor], motorSpeed);
+}
+
+void moveMotorTurnsBack(int motor, float turns) {
+  noInterrupts();
+  encoderCount[motor] = 0;
+  interrupts();
+
+  digitalWrite(MOTOR_DIR_PIN1[motor], LOW);
+  digitalWrite(MOTOR_DIR_PIN2[motor], HIGH);
+  analogWrite(MOTOR_PWM_PIN[motor], motorSpeed);
+}
+
+void waitForMotors(float turns, bool waitLeft, bool waitRight) {
+  long targetPulses = (long)(turns * PULSES_PER_REV);
+
+  bool leftDone  = !waitLeft;
+  bool rightDone = !waitRight;
+
+  while (true) {
+    noInterrupts();
+    long leftCount  = encoderCount[LEFT_MOTOR];
+    long rightCount = encoderCount[RIGHT_MOTOR];
+    interrupts();
+
+    if (waitLeft  && !leftDone  && leftCount  >= targetPulses) {
+      stopMotor(LEFT_MOTOR);
+      leftDone = true;
+    }
+    if (waitRight && !rightDone && rightCount >= targetPulses) {
+      stopMotor(RIGHT_MOTOR);
+      rightDone = true;
+    }
+
+    if (leftDone && rightDone) break;
+    delay(10);
+  }
+}
+
+void stopMotor(int motor) {
+  digitalWrite(MOTOR_DIR_PIN1[motor], LOW);
+  digitalWrite(MOTOR_DIR_PIN2[motor], LOW);
+  analogWrite(MOTOR_PWM_PIN[motor], 0);
+}
+
+void stopAll() {
+  stopMotor(LEFT_MOTOR);
+  stopMotor(RIGHT_MOTOR);
+}
+
+// ======================================
+// MOVEMENT COMMANDS
+// ======================================
+
+void moveForward() {
+  moveMotorTurns(LEFT_MOTOR,  1);
+  moveMotorTurns(RIGHT_MOTOR, 1);
+  waitForMotors(1, true, true);
+}
+
+void moveBack() {
+  moveMotorTurnsBack(LEFT_MOTOR,  1);
+  moveMotorTurnsBack(RIGHT_MOTOR, 1);
+  waitForMotors(1, true, true);
+}
+
+void moveLeft() {
+  moveMotorTurns(LEFT_MOTOR,  0.5);
+  moveMotorTurnsBack(RIGHT_MOTOR, 0.5);
+  waitForMotors(0.5, true, true);
+}
+
+void moveRight() {
+  moveMotorTurnsBack(LEFT_MOTOR,  0.5);
+  moveMotorTurns(RIGHT_MOTOR, 0.5);
+  waitForMotors(0.5, true, true);
+}
+
+
+void moveLeft60() {
+  moveMotorTurnsBack(LEFT_MOTOR,  0.6667);
+  moveMotorTurns(RIGHT_MOTOR, 0.6667);
+  waitForMotors(0.6667, true, true);
+}
+
+void moveRight60() {
+  moveMotorTurns(LEFT_MOTOR,  0.6667);
+  moveMotorTurnsBack(RIGHT_MOTOR, 0.6667);
+  waitForMotors(0.6667, true, true);
+}
+
+// ======================================
+// FORMATIONS (fill in your logic)
+// ======================================
+
+void doTriangle(){
+  moveForward();
+  delay(300);
+  moveRight60();
+  delay(300);
+  moveForward();
+  delay(300);
+  moveRight60();
+  delay(300);
+  moveForward();
+}
+
+
+void doSquare(){
+  moveForward();
+  delay(300);
+  moveRight();
+  delay(300);
+  moveForward();
+  delay(300);
+  moveRight();
+  delay(300);
+  moveForward();
+  delay(300);
+  moveRight();
+  delay(300);
+  moveForward();
+}
+
+
